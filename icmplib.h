@@ -1,0 +1,865 @@
+#pragma once
+
+#ifndef ICMPLIB_PING_DATA_SIZE
+#define ICMPLIB_PING_DATA_SIZE 64
+#endif
+
+#ifndef ICMPLIB_RECV_BUFFER_SIZE
+#define ICMPLIB_RECV_BUFFER_SIZE 65536
+#endif
+
+#ifndef ICMPLIB_ERROR_QUEUE_CONTROL_SIZE
+#define ICMPLIB_ERROR_QUEUE_CONTROL_SIZE 512
+#endif
+
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+
+#include <chrono>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <cstring>
+#include <climits>
+#ifdef _WIN32
+#define _WIN32_WINNT 0x0601
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <cerrno>
+#endif
+#ifdef __linux__
+#include <linux/errqueue.h>
+#endif
+
+#define ICMPLIB_ICMP_ECHO_RESPONSE 0
+#define ICMPLIB_ICMP_DESTINATION_UNREACHABLE 3
+#define ICMPLIB_ICMP_ECHO_REQUEST 8
+#define ICMPLIB_ICMP_TIME_EXCEEDED 11
+#define ICMPLIB_ICMPV6_DESTINATION_UNREACHABLE 1
+#define ICMPLIB_ICMPV6_TIME_EXCEEDED 3
+#define ICMPLIB_ICMPV6_ECHO_REQUEST 128
+#define ICMPLIB_ICMPV6_ECHO_RESPONSE 129
+
+#define ICMPLIB_INET4_HEADER_SIZE 20
+#define ICMPLIB_INET4_TTL_OFFSET 8
+#define ICMPLIB_INET4_ORIGINAL_DATA_SIZE ICMPLIB_INET4_HEADER_SIZE + 8
+#define ICMPLIB_INET6_HEADER_SIZE 40
+#define ICMPLIB_INET6_ORIGINAL_DATA_SIZE ICMPLIB_INET6_HEADER_SIZE + 8
+
+#ifndef ICMPLIB_MAX_PING_DATA_SIZE
+#define ICMPLIB_MAX_PING_DATA_SIZE (ICMPLIB_RECV_BUFFER_SIZE - ICMPLIB_INET4_HEADER_SIZE - 8)
+#endif
+
+#define ICMPLIB_TIMEOUT_1S 1000
+
+#ifdef _WIN32
+#define ICMPLIB_SOCKET SOCKET
+#define ICMPLIB_SOCKLEN int
+#define ICMPLIB_SOCKET_ERROR SOCKET_ERROR
+#define ICMPLIB_CLOSESOCKET closesocket
+#else
+#define ICMPLIB_SOCKET int
+#define ICMPLIB_SOCKLEN socklen_t
+#define ICMPLIB_SOCKET_ERROR -1
+#define ICMPLIB_CLOSESOCKET close
+#endif
+
+#if (defined _WIN32 && defined _MSC_VER)
+#pragma comment(lib, "ws2_32.lib")
+#endif
+
+namespace icmplib {
+#ifdef _WIN32
+    class WinSock {
+    public:
+        WinSock(const WinSock &) = delete;
+        WinSock(WinSock &&) = delete;
+        virtual ~WinSock() {
+            WSACleanup();
+        }
+        WinSock &operator=(const WinSock &) = delete;
+        static WinSock &Initialize() {
+            static WinSock instance;
+            return instance;
+        }
+    private:
+        WinSock() {
+            WSADATA wsaData;
+            int error = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (error != NO_ERROR) {
+                throw std::runtime_error("Cannot initialize WinSock!");
+            }
+            if ((LOBYTE(wsaData.wVersion) != 2) || (HIBYTE(wsaData.wVersion) != 2)) {
+                WSACleanup();
+                throw std::runtime_error("Cannot initialize WinSock!");
+            }
+        }
+    };
+
+#endif
+    class IPAddress {
+    public:
+        enum class Type {
+            IPv4,
+            IPv6,
+            Unknown
+        };
+        IPAddress() {
+            address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+            std::memset(address, 0, sizeof(sockaddr_in));
+            reinterpret_cast<sockaddr_in *>(address)->sin_family = AF_INET;
+        }
+        IPAddress(const std::string &address, Type type = Type::Unknown) : IPAddress() {
+            auto init = [&](Type type) {
+                switch (type) {
+                case Type::IPv6:
+                    delete this->address;
+                    this->address = reinterpret_cast<sockaddr *>(new sockaddr_in6);
+                    std::memset(this->address, 0, sizeof(sockaddr_in6));
+                    reinterpret_cast<sockaddr_in6 *>(this->address)->sin6_family = AF_INET6;
+                    if (inet_pton(AF_INET6, address.c_str(), &reinterpret_cast<sockaddr_in6 *>(this->address)->sin6_addr) <= 0) {
+                        throw std::runtime_error("Incorrect IPv6 address provided");
+                    }
+                    break;
+                case Type::IPv4:
+                default:
+                    if (inet_pton(AF_INET, address.c_str(), &reinterpret_cast<sockaddr_in *>(this->address)->sin_addr) <= 0) {
+                        throw std::runtime_error("Incorrect IPv4 address provided");
+                    }
+                }
+            };
+            if ((type != Type::Unknown) && IsCorrect(address, type)) {
+                init(type);
+                return;
+            } else if (type == Type::Unknown) {
+                if (IsCorrect(address, Type::IPv4)) {
+                    init(Type::IPv4);
+                    return;
+                } else if (IsCorrect(address, Type::IPv6)) {
+                    init(Type::IPv6);
+                    return;
+                }
+            }
+            Resolve(address, type);
+        }
+        IPAddress(const std::string &address, uint16_t port, Type type = Type::Unknown) : IPAddress(address, type) {
+            SetPort(port);
+        }
+        IPAddress(uint32_t address) : IPAddress() {
+            reinterpret_cast<sockaddr_in *>(this->address)->sin_addr.s_addr = htonl(address);
+        }
+        IPAddress(uint32_t address, uint16_t port) : IPAddress(address) {
+            SetPort(port);
+        }
+        IPAddress(const IPAddress &source) {
+            switch (source.GetType()) {
+            case Type::IPv6:
+                address = reinterpret_cast<sockaddr *>(new sockaddr_in6);
+                std::memcpy(address, source.address, sizeof(sockaddr_in6));
+                break;
+            case Type::IPv4:
+            default:
+                address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+                std::memcpy(address, source.address, sizeof(sockaddr_in));
+            }
+        }
+        IPAddress(IPAddress &&source) {
+            address = source.address;
+            source.address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+            std::memset(source.address, 0, sizeof(sockaddr_in));
+            reinterpret_cast<sockaddr_in *>(source.address)->sin_family = AF_INET;
+        }
+        virtual ~IPAddress() {
+            delete address;
+        }
+        IPAddress &operator=(const IPAddress &source) {
+            delete address;
+            switch (source.GetType()) {
+            case Type::IPv6:
+                address = reinterpret_cast<sockaddr *>(new sockaddr_in6);
+                std::memcpy(address, source.address, sizeof(sockaddr_in6));
+                break;
+            case Type::IPv4:
+            default:
+                address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+                std::memcpy(address, source.address, sizeof(sockaddr_in));
+            }
+            return *this;
+        }
+        IPAddress &operator=(IPAddress &&source) {
+            delete address;
+            address = source.address;
+            source.address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+            std::memset(source.address, 0, sizeof(sockaddr_in));
+            reinterpret_cast<sockaddr_in *>(source.address)->sin_family = AF_INET;
+            return *this;
+        }
+        bool operator==(const uint8_t *other) const {
+            return (GetType() == Type::IPv6) && (std::memcmp(&reinterpret_cast<sockaddr_in6 *>(address)->sin6_addr, other, sizeof(in6_addr)) == 0);
+        }
+        bool operator==(const uint32_t other) const {
+            return (GetType() == Type::IPv4) && (reinterpret_cast<sockaddr_in *>(address)->sin_addr.s_addr == other);
+        }
+        bool operator==(const IPAddress &other) const {
+            if (GetType() != other.GetType()) {
+                return false;
+            }
+            switch (GetType()) {
+            case Type::IPv6:
+                return IPAddress::operator==(reinterpret_cast<const uint8_t *>(&reinterpret_cast<const sockaddr_in6 *>(other.address)->sin6_addr));
+            case Type::IPv4:
+            default:
+                return IPAddress::operator==(reinterpret_cast<const sockaddr_in *>(other.address)->sin_addr.s_addr);
+            }
+        }
+        IPAddress &Resolve(const std::string &address, Type type = Type::IPv4) {
+#ifdef _WIN32
+            WinSock::Initialize();
+#endif
+            addrinfo hints;
+            std::memset(&hints, 0, sizeof(addrinfo));
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+
+            addrinfo *result = NULL;
+            if (getaddrinfo(address.c_str(), NULL, &hints, &result) == 0) {
+                for (addrinfo *ptr = result; ptr != NULL; ptr = ptr->ai_next) {
+                    switch (ptr->ai_family) {
+                    case AF_INET:
+                        if ((type != Type::IPv4) && (type != Type::Unknown)) {
+                            break;
+                        }
+                        delete this->address;
+                        this->address = reinterpret_cast<sockaddr *>(new sockaddr_in);
+                        std::memcpy(this->address, ptr->ai_addr, sizeof(sockaddr_in));
+                        freeaddrinfo(result);
+                        type = Type::IPv4;
+                        return *this;
+                    case AF_INET6:
+                        if ((type != Type::IPv6) && (type != Type::Unknown)) {
+                            break;
+                        }
+                        delete this->address;
+                        this->address = reinterpret_cast<sockaddr *>(new sockaddr_in6);
+                        std::memcpy(this->address, ptr->ai_addr, sizeof(sockaddr_in6));
+                        freeaddrinfo(result);
+                        type = Type::IPv6;
+                        return *this;
+                    default:
+                        break;
+                    }
+                }
+                freeaddrinfo(result);
+            }
+            throw std::runtime_error("Cannot resolve host address: " + address);
+        }
+        operator std::string() const {
+            char buffer[INET6_ADDRSTRLEN];
+            switch (GetType()) {
+            case Type::IPv6:
+                if (inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6 *>(address)->sin6_addr, buffer, INET6_ADDRSTRLEN) != NULL) {
+                    return std::string(buffer);
+                }
+                throw std::runtime_error("Cannot convert IPv6 address structure");
+            case Type::IPv4:
+            default:
+                if (inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in *>(address)->sin_addr, buffer, INET6_ADDRSTRLEN) != NULL) {
+                    return std::string(buffer);
+                }
+                throw std::runtime_error("Cannot convert IPv4 address structure");
+            }
+        }
+        void SetPort(uint16_t port) {
+            switch (GetType()) {
+            case Type::IPv6:
+                reinterpret_cast<sockaddr_in6 *>(address)->sin6_port = htons(port);
+                break;
+            case Type::IPv4:
+            default:
+                reinterpret_cast<sockaddr_in *>(address)->sin_port = htons(port);
+            }
+        }
+        uint16_t GetPort() const {
+            switch (GetType()) {
+            case Type::IPv6:
+                return ntohs(reinterpret_cast<sockaddr_in6 *>(address)->sin6_port);
+                break;
+            case Type::IPv4:
+            default:
+                return ntohs(reinterpret_cast<sockaddr_in *>(address)->sin_port);
+            }
+        }
+        Type GetType() const {
+            switch (address->sa_family) {
+            case AF_INET6:
+                return Type::IPv6;
+            case AF_INET:
+            default:
+                return Type::IPv4;
+            }
+        }
+        sockaddr *GetSockAddr() const {
+            return address;
+        }
+        ICMPLIB_SOCKLEN GetSockAddrLength() const {
+            switch (GetType()) {
+            case Type::IPv6:
+                return sizeof(sockaddr_in6);
+            case Type::IPv4:
+            default:
+                return sizeof(sockaddr_in);
+            }
+        }
+        static bool IsCorrect(const std::string &address, Type type = Type::IPv4) {
+            switch (type) {
+            case Type::IPv6: {
+                struct in6_addr addr;
+                return inet_pton(AF_INET6, address.c_str(), &addr) == 1;
+            }
+            case Type::IPv4: {
+                struct in_addr addr;
+                return inet_pton(AF_INET, address.c_str(), &addr) == 1;
+            }
+            default:
+                return IsCorrect(address, Type::IPv4) || IsCorrect(address, Type::IPv6);
+            }
+        }
+        static int GetFamily(Type type) {
+            switch (type) {
+            case Type::IPv6:
+                return AF_INET6;
+            case Type::IPv4:
+            default:
+                return AF_INET;
+            }
+        }
+    private:
+        sockaddr *address;
+    };
+
+    class ICMPEcho {
+    public:
+        struct Result {
+            enum class ResponseType {
+                Success,
+                Unreachable,
+                TimeExceeded,
+                Timeout,
+                Unsupported,
+                Failure
+            } response;
+            double delay;
+            IPAddress address;
+            uint8_t code;
+            uint8_t ttl;
+        };
+        ICMPEcho() = delete;
+        ICMPEcho(const ICMPEcho &) = delete;
+        ICMPEcho(ICMPEcho &&) = delete;
+        ICMPEcho &operator=(const ICMPEcho &) = delete;
+        static Result Execute(const IPAddress &target, unsigned timeout = ICMPLIB_TIMEOUT_1S, uint16_t sequence = 1, uint8_t ttl = 255, uint16_t packet_size = ICMPLIB_PING_DATA_SIZE) {
+            Result result = { Result::ResponseType::Timeout, static_cast<double>(timeout), IPAddress(), 0, 0 };
+            try {
+#ifdef _WIN32
+                WinSock::Initialize();
+#endif
+                ICMPSocket sock(target.GetType(), ttl);
+
+                ICMPRequest request(target.GetType(), sequence, packet_size);
+                request.Send(sock.GetSocket(), target);
+                auto start = std::chrono::high_resolution_clock::now();
+                IPAddress source(target);
+
+                while (true) {
+                    ICMPResponse response;
+                    bool recv = response.Receive(sock.GetSocket(), source, timeout, sock.GetSocketType());
+                    auto end = std::chrono::high_resolution_clock::now();
+                    if (!recv) {
+#ifdef __linux__
+                        Result::ResponseType error_type = Result::ResponseType::Failure;
+                        uint8_t error_code = 0;
+                        if ((sock.GetSocketType() == SocketType::Datagram)
+                            && ReceiveSocketError(sock.GetSocket(), source, error_type, error_code)) {
+                            result.response = error_type;
+                            result.delay = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+                            result.address = source;
+                            result.code = error_code;
+                            break;
+                        }
+#endif
+                        unsigned delta = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+                        if (delta >= timeout) {
+                            break;
+                        }
+                        timeout -= delta;
+                        continue;
+                    }
+                    if (response.GetSize() < sizeof(ICMPHeader)) {
+                        continue;
+                    }
+
+                    bool is_ipv6 = (source.GetType() == IPAddress::Type::IPv6);
+                    ClassifyResult match = is_ipv6
+                        ? GetResponseTypeV6(request, target, source, response)
+                        : GetResponseType(request, target, source, response);
+                    if (match.matched) {
+                        result.response = match.type;
+                        result.delay = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) / 1000.0;
+                        result.address = source;
+                        result.code = response.GetICMPHeader().code;
+                        result.ttl = response.GetTTL();
+                        break;
+                    }
+                }
+            } catch (...) {
+                return { Result::ResponseType::Failure, 0, IPAddress(), 0, 0 };
+            }
+            return result;
+        }
+    private:
+        struct ClassifyResult {
+            bool matched;
+            Result::ResponseType type;
+            static ClassifyResult Unrelated() { return {false, Result::ResponseType::Timeout}; }
+            static ClassifyResult Accept(Result::ResponseType t) { return {true, t}; }
+        };
+
+#pragma pack(push, 1)
+        struct ICMPHeader {
+            uint8_t type;
+            uint8_t code;
+            uint16_t checksum;
+        };
+
+        struct ICMPEchoHeader : ICMPHeader {
+            uint16_t id;
+            uint16_t seq;
+        };
+
+        struct ICMPEchoMessage : ICMPEchoHeader {
+            uint8_t data[ICMPLIB_MAX_PING_DATA_SIZE];
+        };
+
+        struct ICMPErrorData : ICMPHeader {
+            uint32_t unused;
+            uint8_t data[ICMPLIB_INET4_ORIGINAL_DATA_SIZE];
+        };
+
+        struct IPv4Header {
+            uint8_t version_ihl;
+            uint8_t differentiated_services;
+            uint16_t total_length;
+            uint16_t identification;
+            uint16_t fragment_offset;
+            uint8_t ttl;
+            uint8_t protocol;
+            uint16_t checksum;
+            uint32_t source;
+            uint32_t destination;
+        };
+
+        struct IPv6Header {
+            uint32_t version_class_flow;
+            uint16_t payload_length;
+            uint8_t next_header;
+            uint8_t hop_limit;
+            uint8_t source[16];
+            uint8_t destination[16];
+        };
+#pragma pack(pop)
+
+        static constexpr unsigned ICMP_ERROR_DATA_OFFSET = sizeof(ICMPHeader) + sizeof(uint32_t);
+
+        enum class SocketType {
+            Raw,
+            Datagram
+        };
+
+        class ICMPSocket {
+        public:
+            ICMPSocket(IPAddress::Type type, uint8_t ttl) {
+                int protocol = IPPROTO_ICMP;
+                if (type == IPAddress::Type::IPv6) {
+                    protocol = IPPROTO_ICMPV6;
+                }
+
+                socket_type = SocketType::Raw;
+                sock = socket(IPAddress::GetFamily(type), SOCK_RAW, protocol);
+#ifdef __linux__
+                if ((sock < 0) && ((errno == EPERM) || (errno == EACCES))) {
+                    sock = socket(IPAddress::GetFamily(type), SOCK_DGRAM, protocol);
+                    socket_type = SocketType::Datagram;
+                }
+#endif
+#ifdef _WIN32
+                if (sock == INVALID_SOCKET) {
+#else
+                if (sock < 0) {
+#endif
+                    throw std::runtime_error("Cannot initialize socket!");
+                }
+
+                switch (type) {
+                case IPAddress::Type::IPv6: {
+                    int hop_limit = ttl;
+                    if (setsockopt(sock, IPPROTO_IPV6, IPV6_UNICAST_HOPS, reinterpret_cast<char *>(&hop_limit), sizeof(hop_limit)) == ICMPLIB_SOCKET_ERROR) {
+                        ICMPLIB_CLOSESOCKET(sock);
+                        throw std::runtime_error("Cannot set socket options!");
+                    }
+                    break;
+                }
+                case IPAddress::Type::IPv4:
+                default:
+                    if (setsockopt(sock, IPPROTO_IP, IP_TTL, reinterpret_cast<char *>(&ttl), sizeof(uint8_t)) == ICMPLIB_SOCKET_ERROR) {
+                        ICMPLIB_CLOSESOCKET(sock);
+                        throw std::runtime_error("Cannot set socket options!");
+                    }
+                }
+
+#ifdef __linux__
+                if (socket_type == SocketType::Datagram) {
+                    int enabled = 1;
+                    int level = (type == IPAddress::Type::IPv6) ? IPPROTO_IPV6 : IPPROTO_IP;
+                    int option = (type == IPAddress::Type::IPv6) ? IPV6_RECVERR : IP_RECVERR;
+                    if (setsockopt(sock, level, option, &enabled, sizeof(enabled)) == ICMPLIB_SOCKET_ERROR) {
+                        ICMPLIB_CLOSESOCKET(sock);
+                        throw std::runtime_error("Cannot set socket options!");
+                    }
+                }
+#endif
+#ifdef _WIN32
+                unsigned long mode = 1;
+                if (ioctlsocket(sock, FIONBIO, &mode) != NO_ERROR) {
+#else
+                int flags = fcntl(sock, F_GETFL, 0);
+                if ((flags == -1) || fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
+#endif
+                    ICMPLIB_CLOSESOCKET(sock);
+                    throw std::runtime_error("Cannot set socket options!");
+                }
+            }
+            virtual ~ICMPSocket() {
+                ICMPLIB_CLOSESOCKET(sock);
+            }
+            const ICMPLIB_SOCKET &GetSocket() {
+                return sock;
+            }
+            SocketType GetSocketType() const {
+                return socket_type;
+            }
+        private:
+            ICMPLIB_SOCKET sock;
+            SocketType socket_type;
+        };
+
+        class ICMPRequest : public ICMPEchoMessage {
+        public:
+            ICMPRequest() = delete;
+            ICMPRequest(IPAddress::Type protocol, uint16_t sequence = 1, uint16_t size = ICMPLIB_PING_DATA_SIZE) {
+                if (size > ICMPLIB_MAX_PING_DATA_SIZE) {
+                    throw std::invalid_argument("Payload size exceeds maximum allowed size!");
+                }
+                static thread_local std::mt19937 gen(std::random_device{}());
+                id = htons(std::uniform_int_distribution<uint16_t>(0, USHRT_MAX)(gen));
+                type = (protocol != IPAddress::Type::IPv6) ? ICMPLIB_ICMP_ECHO_REQUEST : ICMPLIB_ICMPV6_ECHO_REQUEST;
+                code = 0;
+                checksum = 0;
+                seq = htons(sequence);
+                payload_size = size;
+
+                for (uint16_t i = 0; i < size; ++i) {
+                    data[i] = static_cast<uint8_t>(sequence + i);
+                }
+
+                if (protocol != IPAddress::Type::IPv6) {
+                    checksum = ComputeChecksum(this, sizeof(ICMPEchoHeader) + size);
+                }
+            }
+            void Send(ICMPLIB_SOCKET sock, const IPAddress &address) {
+                int bytes = sendto(sock, reinterpret_cast<const char *>(this), static_cast<int>(sizeof(ICMPEchoHeader) + payload_size), 0, address.GetSockAddr(), address.GetSockAddrLength());
+                if (bytes == ICMPLIB_SOCKET_ERROR) {
+                    throw std::runtime_error("Failed to send request!");
+                }
+            }
+            const uint8_t *GetPayload() const {
+                return data;
+            }
+            uint16_t GetPayloadSize() const {
+                return payload_size;
+            }
+        private:
+            uint16_t payload_size;
+        };
+
+        class ICMPResponse {
+        public:
+            ICMPResponse() : protocol(IPAddress::Type::IPv4), socket_type(SocketType::Raw), header(nullptr), length(0) {
+                std::memset(&buffer, 0, sizeof(uint8_t) * ICMPLIB_RECV_BUFFER_SIZE);
+            }
+            virtual ~ICMPResponse() {
+                if (header) {
+                    delete header;
+                }
+            }
+            bool Receive(ICMPLIB_SOCKET sock, IPAddress &address, unsigned timeout, SocketType socket_type) {
+                fd_set sock_set;
+                FD_ZERO(&sock_set);
+                FD_SET(sock, &sock_set);
+
+                timeval timeout_val;
+                timeout_val.tv_sec = timeout / 1000;
+                timeout_val.tv_usec = (timeout % 1000) * 1000;
+
+                int activity = select(static_cast<int>(sock) + 1, &sock_set, NULL, NULL, &timeout_val);
+                if ((activity <= 0) || !FD_ISSET(sock, &sock_set)) {
+                    return false;
+                }
+
+                ICMPLIB_SOCKLEN length = address.GetSockAddrLength();
+                int bytes = recvfrom(sock, reinterpret_cast<char *>(buffer), ICMPLIB_RECV_BUFFER_SIZE, 0, address.GetSockAddr(), &length);
+                if (bytes <= 0) {
+                    return false;
+                }
+                this->length = static_cast<unsigned>(bytes);
+                this->socket_type = socket_type;
+                protocol = address.GetType();
+                return true;
+            };
+            template <class T>
+            const T Generate(unsigned offset = 0) const {
+                if (!CanGenerate<T>(offset)) {
+                    throw std::runtime_error("Incorrect ICMP packet size!");
+                }
+                T packet;
+                std::memset(&packet, 0, sizeof(T));
+                std::memcpy(&packet, &buffer[GetHeaderOffset() + offset], sizeof(T));
+                return packet;
+            }
+            const ICMPHeader &GetICMPHeader() {
+                if (!header) {
+                    header = new ICMPHeader;
+                    *header = Generate<ICMPHeader>();
+                }
+                return *header;
+            }
+            IPAddress::Type GetProtocol() const {
+                return protocol;
+            }
+            uint8_t GetTTL() const {
+                if (GetHeaderOffset() == 0) {
+                    return 0;
+                }
+                return buffer[ICMPLIB_INET4_TTL_OFFSET];
+            }
+            unsigned GetSize() const {
+                unsigned offset = GetHeaderOffset();
+                return (length > offset) ? length - offset : 0;
+            }
+            template <class T>
+            bool CanGenerate(unsigned offset = 0) const {
+                return (offset <= GetSize()) && (sizeof(T) <= GetSize() - offset);
+            }
+            const uint8_t *GetICMPData(unsigned offset = 0) const {
+                return buffer + GetHeaderOffset() + offset;
+            }
+            SocketType GetSocketType() const {
+                return socket_type;
+            }
+            unsigned GetHeaderOffset() const {
+                return ((protocol == IPAddress::Type::IPv6) || (socket_type == SocketType::Datagram))
+                    ? 0 : ICMPLIB_INET4_HEADER_SIZE;
+            }
+        private:
+            IPAddress::Type protocol;
+            SocketType socket_type;
+            uint8_t buffer[ICMPLIB_RECV_BUFFER_SIZE];
+            ICMPHeader *header;
+            unsigned length;
+        };
+
+        static ClassifyResult GetResponseType(const ICMPRequest &request, const IPAddress &target, const IPAddress &source, ICMPResponse &response) {
+            switch (response.GetICMPHeader().type) {
+            case ICMPLIB_ICMP_ECHO_RESPONSE:
+                return (target == source) ? MatchEchoResponse(request, response) : ClassifyResult::Unrelated();
+            case ICMPLIB_ICMP_DESTINATION_UNREACHABLE:
+                return MatchIPv4ErrorResponse(request, target, response, Result::ResponseType::Unreachable);
+            case ICMPLIB_ICMP_TIME_EXCEEDED:
+                return MatchIPv4ErrorResponse(request, target, response, Result::ResponseType::TimeExceeded);
+            case ICMPLIB_ICMP_ECHO_REQUEST:
+            default:
+                return ClassifyResult::Unrelated();
+            }
+        };
+
+        static ClassifyResult GetResponseTypeV6(const ICMPRequest &request, const IPAddress &target, const IPAddress &source, ICMPResponse &response) {
+            switch (response.GetICMPHeader().type) {
+            case ICMPLIB_ICMPV6_ECHO_RESPONSE:
+                return (target == source) ? MatchEchoResponse(request, response, false) : ClassifyResult::Unrelated();
+            case ICMPLIB_ICMPV6_DESTINATION_UNREACHABLE:
+                return MatchIPv6ErrorResponse(request, target, response, Result::ResponseType::Unreachable);
+            case ICMPLIB_ICMPV6_TIME_EXCEEDED:
+                return MatchIPv6ErrorResponse(request, target, response, Result::ResponseType::TimeExceeded);
+            case ICMPLIB_ICMPV6_ECHO_REQUEST:
+            default:
+                return ClassifyResult::Unrelated();
+            }
+        };
+
+#ifdef __linux__
+        static bool ReceiveSocketError(ICMPLIB_SOCKET sock, IPAddress &source, Result::ResponseType &type, uint8_t &code) {
+            uint8_t data[ICMPLIB_ERROR_QUEUE_CONTROL_SIZE];
+            alignas(cmsghdr) char control[ICMPLIB_ERROR_QUEUE_CONTROL_SIZE];
+
+            iovec buffer;
+            buffer.iov_base = data;
+            buffer.iov_len = sizeof(data);
+
+            msghdr message;
+            std::memset(&message, 0, sizeof(message));
+            message.msg_iov = &buffer;
+            message.msg_iovlen = 1;
+            message.msg_control = control;
+            message.msg_controllen = sizeof(control);
+
+            if (recvmsg(sock, &message, MSG_ERRQUEUE | MSG_DONTWAIT) < 0) {
+                return false;
+            }
+
+            for (cmsghdr *header = CMSG_FIRSTHDR(&message); header != NULL; header = CMSG_NXTHDR(&message, header)) {
+                bool inet4 = (header->cmsg_level == IPPROTO_IP) && (header->cmsg_type == IP_RECVERR);
+                bool inet6 = (header->cmsg_level == IPPROTO_IPV6) && (header->cmsg_type == IPV6_RECVERR);
+                if (!inet4 && !inet6) {
+                    continue;
+                }
+
+                sock_extended_err *error = reinterpret_cast<sock_extended_err *>(CMSG_DATA(header));
+                if (error->ee_origin == SO_EE_ORIGIN_ICMP) {
+                    if (error->ee_type == ICMPLIB_ICMP_TIME_EXCEEDED) {
+                        type = Result::ResponseType::TimeExceeded;
+                    } else if (error->ee_type == ICMPLIB_ICMP_DESTINATION_UNREACHABLE) {
+                        type = Result::ResponseType::Unreachable;
+                    } else {
+                        continue;
+                    }
+                } else if (error->ee_origin == SO_EE_ORIGIN_ICMP6) {
+                    if (error->ee_type == ICMPLIB_ICMPV6_TIME_EXCEEDED) {
+                        type = Result::ResponseType::TimeExceeded;
+                    } else if (error->ee_type == ICMPLIB_ICMPV6_DESTINATION_UNREACHABLE) {
+                        type = Result::ResponseType::Unreachable;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+
+                code = error->ee_code;
+                sockaddr *offender = SO_EE_OFFENDER(error);
+                if (offender->sa_family == AF_INET) {
+                    source = IPAddress(ntohl(reinterpret_cast<sockaddr_in *>(offender)->sin_addr.s_addr));
+                } else if (offender->sa_family == AF_INET6) {
+                    char text[INET6_ADDRSTRLEN];
+                    if (inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6 *>(offender)->sin6_addr, text, INET6_ADDRSTRLEN) != NULL) {
+                        source = IPAddress(text, IPAddress::Type::IPv6);
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+#endif
+
+        static bool MatchEchoRequest(const ICMPRequest &request, const ICMPEchoHeader &echo, SocketType socket_type, bool verify_checksum = false) {
+            if (socket_type == SocketType::Datagram) {
+                return request.seq == echo.seq;
+            }
+            return (request.id == echo.id) && (request.seq == echo.seq) && (!verify_checksum || (request.checksum == echo.checksum));
+        }
+
+        static ClassifyResult MatchEchoResponse(const ICMPRequest &request, ICMPResponse &response, bool verify_checksum = true) {
+            uint16_t payload_size = request.GetPayloadSize();
+            size_t expected_size = sizeof(ICMPEchoHeader) + payload_size;
+            if (response.GetSize() < expected_size) {
+                return ClassifyResult::Unrelated();
+            }
+            ICMPEchoHeader echo = response.Generate<ICMPEchoHeader>();
+            if (!MatchEchoRequest(request, echo, response.GetSocketType())) {
+                return ClassifyResult::Unrelated();
+            }
+            if (std::memcmp(request.GetPayload(), response.GetICMPData(sizeof(ICMPEchoHeader)), payload_size) != 0) {
+                return ClassifyResult::Unrelated();
+            }
+            if (!verify_checksum) {
+                return ClassifyResult::Accept(Result::ResponseType::Success);
+            }
+            return (ComputeChecksum(response.GetICMPData(), expected_size) == 0)
+                ? ClassifyResult::Accept(Result::ResponseType::Success)
+                : ClassifyResult::Accept(Result::ResponseType::Unsupported);
+        }
+
+        static ClassifyResult MatchIPv4ErrorResponse(const ICMPRequest &request, const IPAddress &target, ICMPResponse &response, Result::ResponseType matched_type) {
+            if (!response.CanGenerate<ICMPErrorData>() || !response.CanGenerate<IPv4Header>(ICMP_ERROR_DATA_OFFSET)) {
+                return ClassifyResult::Unrelated();
+            }
+            ICMPErrorData error_data = response.Generate<ICMPErrorData>();
+            IPv4Header original_ip = response.Generate<IPv4Header>(ICMP_ERROR_DATA_OFFSET);
+            unsigned header_length = static_cast<unsigned>(original_ip.version_ihl & 0x0f) * 4;
+            if ((header_length < ICMPLIB_INET4_HEADER_SIZE) || (original_ip.protocol != IPPROTO_ICMP) || !(target == original_ip.destination)) {
+                return ClassifyResult::Unrelated();
+            }
+            if (!response.CanGenerate<ICMPEchoHeader>(ICMP_ERROR_DATA_OFFSET + header_length)) {
+                return ClassifyResult::Unrelated();
+            }
+            ICMPEchoHeader original_echo = response.Generate<ICMPEchoHeader>(ICMP_ERROR_DATA_OFFSET + header_length);
+            if ((original_echo.type != ICMPLIB_ICMP_ECHO_REQUEST) || !MatchEchoRequest(request, original_echo, response.GetSocketType(), true)) {
+                return ClassifyResult::Unrelated();
+            }
+            error_data.checksum = 0;
+            return (response.GetICMPHeader().checksum == ComputeChecksum(&error_data, sizeof(error_data)))
+                ? ClassifyResult::Accept(matched_type)
+                : ClassifyResult::Accept(Result::ResponseType::Unsupported);
+        }
+
+        static ClassifyResult MatchIPv6ErrorResponse(const ICMPRequest &request, const IPAddress &target, ICMPResponse &response, Result::ResponseType matched_type) {
+            if (!response.CanGenerate<IPv6Header>(ICMP_ERROR_DATA_OFFSET) ||
+                !response.CanGenerate<ICMPEchoHeader>(ICMP_ERROR_DATA_OFFSET + ICMPLIB_INET6_HEADER_SIZE)) {
+                return ClassifyResult::Unrelated();
+            }
+            IPv6Header original_ip = response.Generate<IPv6Header>(ICMP_ERROR_DATA_OFFSET);
+            if ((original_ip.next_header != IPPROTO_ICMPV6) || !(target == original_ip.destination)) {
+                return ClassifyResult::Unrelated();
+            }
+            ICMPEchoHeader original_echo = response.Generate<ICMPEchoHeader>(ICMP_ERROR_DATA_OFFSET + ICMPLIB_INET6_HEADER_SIZE);
+            return ((original_echo.type == ICMPLIB_ICMPV6_ECHO_REQUEST) && MatchEchoRequest(request, original_echo, response.GetSocketType()))
+                ? ClassifyResult::Accept(matched_type)
+                : ClassifyResult::Unrelated();
+        }
+
+        static uint16_t ComputeChecksum(const void *data, size_t size) {
+            const uint16_t *element = reinterpret_cast<const uint16_t *>(data);
+            uint32_t sum = 0;
+            size_t remaining = size;
+            for (; remaining > 1; remaining -= 2) {
+                sum += *element++;
+            }
+            if (remaining > 0) {
+                sum += *reinterpret_cast<const uint8_t *>(element);
+            }
+            sum = (sum >> 16) + (sum & 0xffff);
+            sum += (sum >> 16);
+            return static_cast<uint16_t>(~sum);
+        }
+    };
+
+    using PingResult = ICMPEcho::Result;
+    using PingResponseType = ICMPEcho::Result::ResponseType;
+
+    inline PingResult Ping(const IPAddress &target, unsigned timeout = ICMPLIB_TIMEOUT_1S, uint16_t sequence = 1, uint8_t ttl = 255, uint16_t packet_size = ICMPLIB_PING_DATA_SIZE) {
+        return ICMPEcho::Execute(target, timeout, sequence, ttl, packet_size);
+    }
+}
