@@ -1,0 +1,7 @@
+# Compiled TinyPing executable
+/tinyping
+/tinyping.exe
+
+# Object files
+*.o
+*.obj
