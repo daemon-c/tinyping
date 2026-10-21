@@ -5,3 +5,6 @@
 # Object files
 *.o
 *.obj
+
+tests/
+test*.cpp

@@ -82,97 +82,104 @@ void sendNtfyHTTP(const std::string& topic, const std::string& message, const st
     curl_global_cleanup();
 }
 
-/**
- * @brief helper / test function. Ran into issues where macos expects a normal int for ttl
- * the conversion of the ttl in the included lib converts to uint8_t and thus macos never sends out a ping.
- * @test helps determine if the socket is constructed correctly
- */
-void pingStatusHelper(auto ping, std::vector<std::string> hosts, std::string host)
+void pingRunner(std::unordered_map<std::string, bool> hostStatus, std::vector<std::string> hosts, int TTL, std::string topic)
 {
-    using Response = icmplib::PingResult::ResponseType;
- 
-    const char* result = "Unknown";
-
-    switch (ping.response)
+    for (const std::string& host : hosts)
     {
-        case Response::Success:      result = "Success";      break;
-        case Response::Unreachable:  result = "Unreachable";  break;
-        case Response::TimeExceeded: result = "TimeExceeded"; break;
-        case Response::Timeout:      result = "Timeout";      break;
-        case Response::Unsupported:  result = "Unsupported";  break;
-        case Response::Failure:      result = "Failure";      break;
+        bool& lastPingGood = hostStatus.at(host);
+
+        // sends out ping, can use its response to do other things
+
+        auto ping = icmplib::Ping(host, ICMPLIB_TIMEOUT_1S, 1, TTL);
+        
+        switch (ping.response)
+        {
+            case icmplib::PingResult::ResponseType::TimeExceeded:
+                if (lastPingGood)
+                {
+                    sendNtfyHTTP(topic, "Host " + host + " is offline.", "tinyping: Alert");
+                    lastPingGood = false;
+                }
+                break;
+            case icmplib::PingResult::ResponseType::Success:
+                if (lastPingGood == true)
+                {
+                    // do nothing as last ping was good. since still good, do nothing
+                    break;
+                }
+                else
+                {
+                    // last ping was not good, send update notification
+                    sendNtfyHTTP(topic, "Host " + host + " is back online.", "tinyping: Recovery");
+                    lastPingGood = true;
+                }
+                break;
+            default:
+                if (lastPingGood)
+                {
+                    // blanket case, set hosts last ping to bad
+                    sendNtfyHTTP(topic, "Host " + host + " is unreachable (Unknown Error).", "tinyping: Alert");
+                    lastPingGood = false;
+                }
+                break;
+        }
     }
 
-        std::cout << host << ": " << result << std::endl;
-        std::cout << host << ": "
-        << (ping.response == icmplib::PingResult::ResponseType::Success
-            ? "UP"
-            : "PING FAILED")
-        << std::endl;
+    // keeps cpu from maxing out, sends out pings every # of sec defined
+    // default 10 sec
+    std::this_thread::sleep_for(std::chrono::seconds(10));
 }
 
-
-int main()
+void configurationCheck(const auto filePath)
 {
-    // dr.google says 64 is normal ttl for linux
-    int TTL = 64;
+    std::ofstream file(filePath, std::ios::app);
 
-    // upon first run, check for config file in path
-    const auto dataDirectory = getDataDirectory();
-    std::filesystem::create_directories(dataDirectory);
-
-    const auto filePath = dataDirectory / "tinyping.conf";
-
-    // Create the file if missing; preserve existing contents.
+    if (!file)
     {
-        // begin scope for creating file and filling it in if it does not exist
-        std::ofstream file(filePath, std::ios::app);
-
-        if (!file)
-        {
-            throw std::runtime_error(
-                "Could not open or create: " + filePath.string()
-            );
-        }
-
-        if (std::filesystem::is_empty(filePath))
-        {
-            file << "# Enter IP addresses or hostnames below.\n"
-                << "# One IP or hostname per line.\n"
-                << "# Set your ntfy topic after the > symbol.\n"
-                << "> enter_ntfy_topic_here\n"
-                << "8.8.8.8\n";
-        }
-        // end scope for creating file and filling it in if it does not exist
+        throw std::runtime_error(
+            "Could not open or create: " + filePath.string()
+        );
     }
 
-    
-    // Helper routine to remove surrounding spaces, tabs, and carriage returns.
-    auto trim = [](const std::string& text) -> std::string
+    if (std::filesystem::is_empty(filePath))
     {
-        const auto first = text.find_first_not_of(" \t\r\n");
+        file << "# Enter IP addresses or hostnames below.\n"
+            << "# One IP or hostname per line.\n"
+            << "# Set your ntfy topic after the > symbol.\n"
+            << "> enter_ntfy_topic_here\n"
+            << "8.8.8.8\n";
+    }
+    
+}
 
-        if (first == std::string::npos)
-        {
-            return "";
-        }
-
-        const auto last = text.find_last_not_of(" \t\r\n");
-        return text.substr(first, last - first + 1);
-    };
-
+std::ifstream fileHelper(const auto filePath)
+{
     std::ifstream file(filePath);
     if (!file)
     {
         throw std::runtime_error(
             "Could not read: " + filePath.string()
         );
+        EXIT_FAILURE;
+    }
+    return file;
+}
+
+auto trim = [](const std::string& text) -> std::string
+{
+    const auto first = text.find_first_not_of(" \t\r\n");
+
+    if (first == std::string::npos)
+    {
+        return "";
     }
 
-    std::vector<std::string> hosts;
-    std::string topic;
-    std::string line;
+    const auto last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+};
 
+void fileTrim(std::ifstream &file, std::string line, std::string topic, std::vector<std::string> hosts)
+{
     while (std::getline(file, line))
     {
         line = trim(line);
@@ -191,7 +198,31 @@ int main()
             hosts.push_back(line);
         }
     }
+}
 
+int main()
+{
+    // dr.google says 64 is normal ttl for linux
+    int TTL = 64;
+
+    // upon first run, check for config file in path
+    const auto dataDirectory = getDataDirectory();
+    std::filesystem::create_directories(dataDirectory);
+
+    const auto filePath = dataDirectory / "tinyping.conf";
+
+    // create configuration if it does not exist
+    configurationCheck(filePath);
+    std::ifstream file = fileHelper(filePath);
+    std::vector<std::string> hosts;
+    std::string topic;
+    std::string line;
+
+    // trim the file down. look for unexpected white spaces
+    fileTrim(file, line, topic, hosts);
+    
+
+    
     if (topic.empty() || topic == "enter_ntfy_topic_here")
     {
         std::cerr << "Set your ntfy topic in: " << filePath << '\n';
@@ -205,6 +236,7 @@ int main()
     }
 
     // using unordered map to set status for each host prior to main loop.
+    // causes incorrect ping messages to be sent out at start of program
     std::unordered_map<std::string, bool> hostStatus;
     for (const auto& host : hosts)
     {
@@ -215,51 +247,6 @@ int main()
     // loop over ping targets in config file
     while (true)
     {
-        
-
-        for (const std::string& host : hosts)
-        {
-            bool& lastPingGood = hostStatus.at(host);
-
-            // sends out ping, can use its response to do other things
-
-            auto ping = icmplib::Ping(host, ICMPLIB_TIMEOUT_1S, 1, TTL);
-            
-            switch (ping.response)
-            {
-                case icmplib::PingResult::ResponseType::TimeExceeded:
-                    if (lastPingGood)
-                    {
-                        sendNtfyHTTP(topic, "Host " + host + " is offline.", "tinyping: Alert");
-                        lastPingGood = false;
-                    }
-                    break;
-                case icmplib::PingResult::ResponseType::Success:
-                    if (lastPingGood == true)
-                    {
-                        // do nothing as last ping was good. since still good, do nothing
-                        break;
-                    }
-                    else
-                    {
-                        // last ping was not good, send update notification
-                        sendNtfyHTTP(topic, "Host " + host + " is back online.", "tinyping: Recovery");
-                        lastPingGood = true;
-                    }
-                    break;
-                default:
-                    if (lastPingGood)
-                    {
-                        // blanket case, set hosts last ping to bad
-                        sendNtfyHTTP(topic, "Host " + host + " is unreachable (Unknown Error).", "tinyping: Alert");
-                        lastPingGood = false;
-                    }
-                    break;
-            }
-        }
-
-        // keeps cpu from maxing out, sends out pings every # of sec defined
-        // default 10 sec
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        pingRunner(hostStatus, hosts, TTL, topic);
     }
 }
