@@ -178,7 +178,7 @@ auto trim = [](const std::string& text) -> std::string
     return text.substr(first, last - first + 1);
 };
 
-void fileTrim(std::ifstream &file, std::string line, std::string topic, std::vector<std::string> hosts)
+void fileTrim(std::ifstream &file, std::string& line, std::string& topic, std::vector<std::string>& hosts)
 {
     while (std::getline(file, line))
     {
