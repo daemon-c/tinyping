@@ -82,7 +82,7 @@ void sendNtfyHTTP(const std::string& topic, const std::string& message, const st
     curl_global_cleanup();
 }
 
-void pingRunner(std::unordered_map<std::string, bool> hostStatus, std::vector<std::string> hosts, int TTL, std::string topic)
+void pingRunner(std::unordered_map<std::string, bool>& hostStatus, std::vector<std::string>& hosts, int TTL, std::string& topic)
 {
     for (const std::string& host : hosts)
     {
@@ -178,7 +178,7 @@ auto trim = [](const std::string& text) -> std::string
     return text.substr(first, last - first + 1);
 };
 
-void fileTrim(std::ifstream &file, std::string& line, std::string& topic, std::vector<std::string>& hosts)
+void fileTrim(std::ifstream& file, std::string& line, std::string& topic, std::vector<std::string>& hosts)
 {
     while (std::getline(file, line))
     {
